@@ -1,0 +1,207 @@
+substitutions:
+  friendly_name: beelancia-tara
+
+esphome:
+  name: beelancia-tara
+
+# https://gist.github.com/markusressel/e888544d4404fbed4c841ec83df638bb
+
+esp8266:
+  board: d1_mini
+
+
+mqtt:
+  broker: mqtt.server.com
+  username: mqtt_username
+  password: mqtt_password
+
+# Enable Home Assistant API
+api:
+
+web_server:
+  port: 80
+
+
+ota:
+  password: "xxx"
+
+wifi:
+  networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+  - ssid: VILLAGGIOGLOBALE
+    password: "xxx"
+  - ssid: villaggioglobale
+    password: "xxx"
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "BeelanciaTara Fallback Hotspot"
+    password: "beelancia"
+
+globals:
+  - id: initial_zero
+    type: float
+    restore_value: yes
+    # NOTE: make sure to align this value to the one used in "calibrate_linear" below!
+    initial_value: '-1300'
+
+  - id: auto_tare_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: auto_tare_difference
+    type: float
+    restore_value: yes
+    initial_value: '0'
+
+  - id: manual_tare_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# Enable logging
+logger:
+  level: INFO
+
+switch:
+  ## Switch to enable/disable the auto tare feature
+  - platform: template
+    id: smart_scale_continuous_tare_enabled
+    name: "Smart Scale Continuous Tare Enabled"
+    lambda: |-
+      return id(auto_tare_enabled);
+    turn_on_action:
+      - lambda: |-
+          id(auto_tare_enabled) = true;
+    turn_off_action:
+      - lambda: |-
+          id(auto_tare_enabled) = false;
+
+  ## Switch used to initiate a manual tare
+  - platform: template
+    id: smart_scale_manual_tare_action_switch
+    name: "Smart Scale Manual Tare Action"
+    lambda: |-
+      return id(manual_tare_flag);
+    turn_on_action:
+      - lambda: |-
+          id(auto_tare_difference) = id(initial_zero) - id(smart_scale_hx711_value_raw).state;
+      - switch.turn_off: smart_scale_manual_tare_action_switch
+    turn_off_action:
+      - lambda: |-
+          id(manual_tare_flag) = false;
+
+# Sensors for ESP version and WIFI information
+text_sensor:
+  - platform: version
+    hide_timestamp: true
+    name: '${friendly_name} - ESPHome Version'
+  - platform: wifi_info
+    ip_address:
+      name: '${friendly_name} - IP Address'
+      icon: mdi:wifi
+    ssid:
+      name: '${friendly_name} - Connected SSID'
+      icon: mdi:wifi-strength-2
+
+## Sensor Configuration ##
+sensor:
+  # WiFi signal
+  - platform: wifi_signal
+    name: "${friendly_name} - WiFi Signal"
+    update_interval: 120s
+
+  # template sensors from global variables
+  - platform: template
+    id: smart_scale_initial_zero
+    name: "Smart Scale Initial Zero"
+    lambda: |-
+      return id(initial_zero);
+    update_interval: 4s
+
+
+  - platform: template
+    id: smart_scale_auto_tare_difference
+    name: "Smart Scale Auto Tare Difference"
+    lambda: |-
+      return id(auto_tare_difference);
+    update_interval: 4s
+
+  # sensors imported from home assistant
+  - platform: homeassistant
+    id: homeassistant_initial_zero
+    entity_id: input_number.smart_scale_initial_zero
+    on_value:
+      then:
+        - lambda: |-
+            id(initial_zero) = x;
+
+  # RAW Scale input
+  - platform: hx711
+    id: smart_scale_hx711_value_raw
+    name: "Smart Scale HX711 RAW Value"
+    internal: False
+    dout_pin: D0
+    clk_pin: D1
+    gain: 128
+    unit_of_measurement: kg
+    accuracy_decimals: 3
+    update_interval: 4s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 3
+          send_every: 1
+    on_value:
+      then:
+        - sensor.template.publish:
+            id: smart_scale_hx711_value
+            state: !lambda 'return id(smart_scale_hx711_value_raw).state;'
+        - if:
+            condition:
+              and:
+                - lambda: 'return id(auto_tare_enabled);'
+                # current smart scale value is below approx. 1KG (raw value -275743) aka nobody is standing on the scale
+                - lambda: 'return id(smart_scale_hx711_value).state < 2.0;'
+            then:
+              - if:
+                  condition:
+                    # current raw scale value is below expected zero value
+                    - lambda: 'return id(smart_scale_hx711_value_raw).state < (id(initial_zero) - id(auto_tare_difference));'
+                  then:
+                    # INcrease Auto-Tare offset to slowly align real zero value with expected zero value
+                    - lambda: |-
+                        id(auto_tare_difference) += 1;
+                  else:
+                    # DEcrease Auto-Tare offset to slowly align real zero value with expected zero value
+                    - lambda: |-
+                        id(auto_tare_difference) -= 1;
+
+
+  # Mapped value to KG
+  - platform: template
+    id: smart_scale_hx711_value
+    name: "Smart Scale HX711 Value"
+    internal: False
+    filters:
+      # apply auto_tare difference
+      - lambda: 'return x + id(auto_tare_difference);'
+      # apply rough calibration
+      - calibrate_linear:
+          # retrieve these values by evaluating the raw values with loads of known mass.
+          # note that a bigger difference between measurements usually results in higher resolution,
+          # so measure 0 Kg and the highest known mass you have (like f.ex. your own weight, measured by a normal scale with good accuracy)
+          - -1300 -> 0
+          - -1282 -> 10
+      # map values below 0.1 to 0 (to decrease value changes due to random fluctuation)
+      - lambda: |-
+          if (x <= 0.1) {
+            return 0.0;
+          } else {
+            return x;
+          }
+
+    unit_of_measurement: kg
+    accuracy_decimals: 2
+    update_interval: 4s
